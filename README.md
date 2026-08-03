@@ -1,470 +1,243 @@
-# QPPE: Query Performance Prediction Engine for PostgreSQL
+# QPPE: Certified Query Steering
 
-![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12+-336791.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)
+Reproducibility repository for **"Certified Query Steering: Finite-Sample
+Risk Control for Learned Plan Selection"**, submitted to *The VLDB Journal*.
 
-## Overview
+## What this is
 
-QPPE (Query Performance Prediction Engine) is an AI-assisted query optimization system for PostgreSQL that uses machine learning to predict query execution performance. By learning from historical query execution patterns, QPPE can classify queries into performance categories (Fast, Medium, Slow) and help optimize query plan selection.
+QPPE wraps learned PostgreSQL query-plan steering in a finite-sample
+**conformal risk certificate**. A machine-learned model scores candidate
+plans for regression risk and improvement potential, but the system is
+only allowed to steer a query to a non-default plan when a calibration
+procedure certifies that doing so keeps the probability of a *materially
+severe regression* below a pre-declared bound (by default: more than 2x
+slower **and** more than 1 second slower than the default plan, or a
+timeout). If the calibration record can't support that guarantee, the
+system abstains and runs the default plan — and we treat that abstention
+as a correct, desirable outcome, not a failure.
 
-### Key Features
+Every script below is part of one continuous pipeline: later scripts
+import earlier ones, and every number, table, and figure in the paper
+traces back to one of them. Run them in order; each is a single command
+and resumable if interrupted.
 
-- **Machine Learning Classification**: Gradient Boosting classifier with 85%+ accuracy
-- **Balanced Training**: SMOTE (Synthetic Minority Over-sampling Technique) for class balance
-- **Cost-Sensitive Learning**: Weighted learning to handle class imbalance
-- **TPC-H Benchmark Support**: Pre-configured for TPC-H benchmark queries
-- **Comprehensive Visualization**: 10 publication-ready figures for analysis
-- **Cross-Platform**: Windows and Linux compatible (TCP sockets)
+## Requirements
 
-### Performance Targets
+- Python 3.11+ (`py` on Windows, `python3` on Linux/macOS)
+- PostgreSQL 18.x running locally
+- DuckDB and MySQL 8.x, for the portability chapter only (Steps 9a/9b)
+- `pip install -r requirements.txt`
 
-| Metric | Target | Typical Result |
-|--------|--------|----------------|
-| Overall Accuracy | ≥ 80% | 85%+ |
-| Fast Class F1 | ≥ 80% | 87%+ |
-| Medium Class F1 | ≥ 80% | 84%+ |
-| Slow Class F1 | ≥ 80% | 87%+ |
-| Training Samples | ≥ 1000 | 1200+ |
-| Class Balance Ratio | ≥ 0.75 | ~1.0 |
-
----
-
-## System Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| OS | Windows 10 / Ubuntu 20.04 | Windows 11 / Ubuntu 22.04 |
-| PostgreSQL | 12+ | 14+ |
-| Python | 3.8+ | 3.10+ |
-| RAM | 4 GB | 8 GB+ |
-| Storage | 1 GB | 5 GB |
+Standard invocation pattern throughout: `py stepN_name.py --user postgres
+--password <yours>`
 
 ---
 
-## Quick Start
+## The pipeline, step by step
 
-### 1. Clone the Repository
+### Phase 0 — Environment setup
 
-```bash
-git clone https://github.com/yourusername/qppe.git
-cd qppe
-```
+**`step1_check_env.py`** and **`step1b_remaining_checks.py`**
+Verify the PostgreSQL install actually supports what the rest of the
+pipeline needs before any real work starts: all 13 planner-steering GUCs
+respond correctly, `SET LOCAL` scoping behaves as expected (so hint sets
+don't leak between queries), and `EXPLAIN (FORMAT JSON)` output parses
+cleanly. Cheap to run, and catches environment problems early rather than
+three hours into a corpus collection run.
 
-### 2. Install Python Dependencies
+### Phase 1 — TPC-H corpus construction
 
-```bash
-# Create virtual environment (recommended)
-python -m venv venv
+**`step2_inspect_tpch.py`**
+Inspects an existing TPC-H installation. This is where we discovered the
+original database was scale factor 0.04, not 1 — mislabeled data that had
+been silently corrupting an earlier draft of this project's results.
 
-# Activate virtual environment
-# Windows:
-.\venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
+**`step2b_build_sf1.py`**
+Builds a properly spec-verified TPC-H SF1 database from scratch via
+DuckDB's built-in `dbgen`, then checks the result against the known-correct
+row counts (`lineitem`: 6,001,215 rows) rather than trusting the generator
+blindly.
 
-# Install dependencies
-pip install -r requirements.txt
-```
+**`step2c_configure.py`**
+Applies and freezes the PostgreSQL configuration used for every timing
+measurement in the paper (`shared_buffers=7GB`, `work_mem=64MB`, JIT off,
+parallelism capped) — held constant so that timing differences reflect the
+steering decision, not a moving configuration target.
 
-### 3. Setup Database
+**`step3a_collect_plans.py`**
+For every query template, collects a candidate plan under each of 12 hint
+sets (combinations of planner GUCs like `enable_nestloop`,
+`enable_hashjoin`, `enable_seqscan`), deduplicated by a structural hash of
+the plan tree.
 
-```bash
-# Create database
-createdb tpch
+**`step3b_execute_plans.py`**
+Executes every *distinct* plan: one untimed warm-up run, then three timed
+runs, with an adaptive timeout (3x the default plan's own runtime, floor
+10s, cap 120s) so that a handful of catastrophic candidates can't stall
+the whole collection run for hours.
 
-# Load TPC-H sample data
-psql -d tpch -f sql/0_create_tpch_sample.sql
+**`step3c_expand_corpus.py`**
+Expands the corpus to its final form: 20 templates, 89 query instances.
+This script also exports the shared `TEMPLATES`, `HINT_SETS`, and plan
+feature-extraction code that every later script imports — it's the
+backbone the rest of the pipeline is built on.
 
-# Setup QPPE schema
-psql -d tpch -f sql/1_schema_setup.sql
-```
+### Phase 2 — Model and feature iteration
 
-### 4. Generate Training Data
+This phase is a record of what *didn't* work, kept because the dead ends
+are informative:
 
-```bash
-python scripts/2_generate_balanced_data.py \
-    --db tpch \
-    --user postgres \
-    --password YOUR_PASSWORD \
-    --target-samples 400
-```
+**`step4_label_and_train.py`**
+First attempt at a regression-risk classifier, using raw plan features
+(estimated cost, row counts) directly. Overfits to template-specific
+scale — a feature that means one thing for a simple 2-table join means
+something completely different for a 6-way join, and the model can't
+generalize across templates as a result.
 
-### 5. Train the Model
+**`step4b_model_v2.py`**
+Fixes this with scale-invariant *ratio* and *delta* features (candidate
+cost ÷ default cost, rather than either in isolation). This is the fix
+that makes cross-template generalization possible at all.
 
-```bash
-python scripts/3_qppe_service.py \
-    --db-name tpch \
-    --db-user postgres \
-    --db-password YOUR_PASSWORD \
-    --train-only
-```
+**`step4c_two_head_policy.py`**
+Splits the model into two heads: one scoring regression risk, one scoring
+win probability — the architecture the final policy still uses.
 
-### 6. Validate the Implementation
+**`step4d_two_head_expanded.py`**
+Expands the training corpus to include censored (timed-out) plans,
+explicitly labeled as forced regressions rather than silently dropped.
 
-```bash
-python scripts/5_validate_qppe.py \
-    --db tpch \
-    --user postgres \
-    --password YOUR_PASSWORD
-```
+**`step4e_enriched_features.py`**
+Adds node-level plan features — maximum nested-loop inner cardinality,
+maximum intermediate-result blow-up, dominant-node cost share — which is
+what finally lets the win-head recognize a good steering opportunity in a
+template it never saw during training.
 
-### 7. Generate Visualizations
+### Phase 3 — The conformal gate (first construction)
 
-```bash
-python scripts/4_visualize_results.py \
-    --db tpch \
-    --user postgres \
-    --password YOUR_PASSWORD \
-    --output-dir ./figures
-```
+**`step5_conformal_gate.py`**
+Introduces the actual certificate: a Clopper–Pearson-calibrated
+threshold, the largest one whose upper confidence bound on the regression
+rate stays under the target level. Runs the first two validity
+experiments (E1: stationary workload, E2: shift to an unseen template).
 
----
+**`step6_live_loop.py`**
+The first attempt at a real, live, end-to-end run — not simulation.
+Calibrating on a single 75/25 split turns out to be a mistake: the
+calibration set doesn't contain enough clean examples, and the threshold
+comes back as `t* = 0`. The system correctly refuses to steer anything,
+which is the right behavior given insufficient evidence — but it's also
+the first sign of a deeper sample-size problem the project spends the
+next several steps chasing down.
 
-## Project Structure
+**`step6b_cross_conformal.py`**
+Fixes it with 5-fold cross-fitted calibration instead of a single split.
+Result: `t* = 0.218`, and live on 17 fresh queries: 16 steered, 0
+regressions, +23.6% net workload improvement. The headline TPC-H result,
+at this stage of the construction.
 
-```
-qppe/
-├── README.md                          # This file
-├── requirements.txt                   # Python dependencies
-├── LICENSE                            # MIT License
-│
-├── sql/                               # SQL scripts
-│   ├── 0_create_tpch_sample.sql      # TPC-H sample data generator
-│   └── 1_schema_setup.sql            # QPPE schema and tables
-│
-├── scripts/                           # Python scripts
-│   ├── 2_generate_balanced_data.py   # Training data generator
-│   ├── 3_qppe_service.py             # ML service with SMOTE
-│   ├── 4_visualize_results.py        # Visualization generator
-│   └── 5_validate_qppe.py            # Validation script
-│
-└── figures/                           # Generated visualizations
-    ├── 1_class_distribution.png
-    ├── 2_execution_time_distribution.png
-    ├── 3_feature_importance.png
-    ├── 4_confusion_matrix.png
-    ├── 5_model_performance_metrics.png
-    ├── 6_query_template_analysis.png
-    ├── 7_feature_correlations.png
-    ├── 8_learning_curve.png
-    ├── 9_performance_improvement.png
-    └── 10_training_summary_dashboard.png
-```
+### Phase 4 — The JOB benchmark and the valid construction
 
----
+This phase is where the project's central theoretical contribution
+actually gets discovered, through a sequence of failures that turn out to
+be more informative than a clean success would have been.
 
-## Detailed Usage
+**`step7a_setup_job.py`**
+Loads the IMDB dataset and the 113 JOB (Join Order Benchmark) queries —
+real, correlated, skewed data, unlike TPC-H's uniform synthetic
+distributions.
 
-### Training Data Generation
+**`step7b_job_pipeline.py`**
+Collects and executes the JOB corpus: 113 queries x 12 hint sets. JOB is
+dramatically harsher than TPC-H — individual default-plan failures up to
+43x worse than the best alternative.
 
-The data generator creates balanced training samples across three performance classes:
+**`step7c_job_analysis.py`**
+Runs E1/E2 on JOB and a new E3 (cross-benchmark transfer: calibrate on
+TPC-H, deploy cold on JOB). The gate seals shut entirely — `t* = 0` on
+JOB no matter how it's calibrated.
 
-- **Fast** (Class 0): Execution time < 100ms
-- **Medium** (Class 1): 100ms ≤ Execution time < 1000ms  
-- **Slow** (Class 2): Execution time ≥ 1000ms
+**`step7d_gate_diagnostics.py`**
+Diagnoses why: the risk model's ranking is fine (AUC ~0.87), but the
+*clean lowest-risk prefix* — how many of the safest-ranked candidates in
+a row are actually safe — is only 2. Far too short to support any
+threshold.
 
-```bash
-python scripts/2_generate_balanced_data.py \
-    --db tpch \
-    --user postgres \
-    --password YOUR_PASSWORD \
-    --host localhost \
-    --port 5432 \
-    --target-samples 400  # Per class (1200+ total)
-```
+**`step7e_severity_gate.py`**
+Tries relabeling the certified event as "severe" (>2x slowdown) rather
+than any regression. Prefix improves to 7 — better, still not enough.
 
-**Options:**
-- `--target-samples`: Target samples per class (default: 400)
-- `--db`: Database name (default: tpch)
-- `--user`: PostgreSQL username (default: postgres)
-- `--password`: PostgreSQL password
-- `--host`: Database host (default: localhost)
-- `--port`: Database port (default: 5432)
+**`step7f_material_severity.py`**
+Adds an absolute-damage floor to the event definition: severe means >2x
+slowdown **and** >1 second of added latency. Prefix jumps to 32, and the
+gate finally opens — but E1 reveals a new problem: the realized violation
+rate exceeds its own target in 7 of 20 workload draws, when only about 2
+would be expected. The naive calibration construction is
+**anti-conservative** on this harsher benchmark.
 
-### Model Training
+**`step7g_policy_calibration.py`**
+First attempt at the fix: calibrate the deployed policy directly, with
+queries (not candidates) as the exchangeable unit. A bug in the
+threshold-search order causes it to fail at the first grid point tried.
 
-The ML service uses Gradient Boosting with SMOTE and cost-sensitive learning:
+**`step7h_select_then_certify.py`**
+A cleaner attempt, which fails for an entirely different, more
+informative reason: the corpus is arithmetically too small to support a
+held-out calibration split at all. This is where the paper's sample-size
+floor theorem comes from directly — it isn't derived first and confirmed
+later, it's discovered by hitting the wall in practice.
 
-```bash
-# Train only (no server)
-python scripts/3_qppe_service.py --db-name tpch --train-only
+**`step7i_certified_live.py`**
+The valid construction: cross-fitted, policy-level, query-unit
+calibration, validated live on fresh queries on *both* benchmarks. TPC-H:
++15.0% net, 0 severe regressions. JOB: the gate correctly abstains on all
+15 fresh queries rather than guess — exactly the behavior the sample-size
+floor predicts, now demonstrated live rather than just derived.
 
-# Train and start prediction server
-python scripts/3_qppe_service.py --db-name tpch --train-first
+### Phase 5 — Figures, portability, and the appendix
 
-# Start server with existing model
-python scripts/3_qppe_service.py --db-name tpch
-```
+**`step8_make_figures.py`**
+Regenerates all 8 figures in the paper directly from the logged
+databases and pickled corpora — nothing in the figures is hand-edited.
 
-**Training Options:**
-- `--train-only`: Train model and exit
-- `--train-first`: Train before starting server
-- `--no-smote`: Disable SMOTE oversampling
-- `--no-cost-sensitive`: Disable class weights
-- `--model`: Model file path (default: qppe_model_enhanced.pkl)
+**`step9a_duckdb_port.py`**
+Ports the entire framework to DuckDB. Finding: DuckDB's default plans are
+already close to optimal on this workload (~5% oracle headroom), so the
+gate correctly certifies almost nothing — there's little unsafe headroom
+to protect against in the first place.
 
-### Prediction Service
+**`step9b_mysql_port.py`**
+Ports to MySQL. Different finding, same correct behavior: MySQL's default
+plans are genuinely far from optimal, but the available steering knobs
+(`optimizer_switch`) are too coarse to reach the better plans that likely
+exist — so again, the gate mostly abstains, for a different underlying
+reason than DuckDB.
 
-The service listens on TCP port 5555 (configurable):
-
-```bash
-python scripts/3_qppe_service.py \
-    --db-name tpch \
-    --host 127.0.0.1 \
-    --port 5555
-```
-
-**Service Protocol:**
-1. Client sends feature count (64 bytes, text)
-2. Client sends features (feature_count × 8 bytes, doubles)
-3. Server responds with prediction (4 bytes, int: 0/1/2)
-
-### Visualization
-
-Generate all 10 figures for analysis and documentation:
-
-```bash
-python scripts/4_visualize_results.py \
-    --db tpch \
-    --output-dir ./figures \
-    --model qppe_model_enhanced.pkl
-```
-
-**Generated Figures:**
-1. Class Distribution (bar + pie)
-2. Execution Time Distribution (histogram + boxplot)
-3. Feature Importance (horizontal bar)
-4. Confusion Matrix (heatmap)
-5. Per-Class Performance Metrics (grouped bar)
-6. Query Template Analysis (stacked bar)
-7. Feature Correlations (heatmap)
-8. Learning Curve (line plot)
-9. Performance Improvement (comparison bar)
-10. Training Summary Dashboard (multi-panel)
+**`step10_appendix.py`**
+Recomputes every table and calibration in the paper's statistical
+appendix directly from the primary logged data — the check that nothing
+in the writeup drifted from what the scripts actually produced.
 
 ---
 
-## Database Schema
+## Data artifacts
 
-### Training Data Table
-
-```sql
-CREATE TABLE qppe_training_data (
-    id SERIAL PRIMARY KEY,
-    query_hash TEXT NOT NULL,
-    query_template TEXT,
-    
-    -- Features
-    num_joins INT,
-    num_relations INT,
-    join_depth INT,
-    est_rows BIGINT,
-    est_cost FLOAT,
-    has_subquery BOOLEAN,
-    has_aggregation BOOLEAN,
-    has_sort BOOLEAN,
-    has_hash BOOLEAN,
-    num_hash_joins INT,
-    num_merge_joins INT,
-    num_nested_loops INT,
-    num_seq_scans INT,
-    num_index_scans INT,
-    selectivity FLOAT,
-    
-    -- Labels
-    actual_time FLOAT NOT NULL,
-    performance_class INT NOT NULL CHECK (performance_class IN (0, 1, 2)),
-    
-    execution_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### Configuration Table
-
-```sql
-CREATE TABLE qppe_config (
-    parameter TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    description TEXT
-);
-```
-
-Key parameters:
-- `fast_threshold_ms`: Upper bound for Fast class (default: 100)
-- `slow_threshold_ms`: Lower bound for Slow class (default: 1000)
-- `penalty_fast`: Cost multiplier for Fast predictions (default: 0.95)
-- `penalty_slow`: Cost multiplier for Slow predictions (default: 1.3)
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**1. "No training data available"**
-```bash
-# Generate training data first
-python scripts/2_generate_balanced_data.py --db tpch --password YOUR_PASSWORD
-```
-
-**2. "Insufficient samples for SMOTE"**
-```bash
-# Increase target samples
-python scripts/2_generate_balanced_data.py --target-samples 500
-```
-
-**3. "Database connection failed"**
-```bash
-# Check PostgreSQL is running
-pg_isready
-
-# Verify credentials
-psql -U postgres -d tpch -c "SELECT 1;"
-```
-
-**4. "Model accuracy below 80%"**
-- Generate more training data
-- Ensure balanced class distribution
-- Try adjusting classification thresholds
-
-**5. "matplotlib style not found"**
-```bash
-# Update matplotlib
-pip install --upgrade matplotlib
-```
-
-### Checking Data Quality
-
-```sql
--- Check class distribution
-SELECT * FROM qppe_training_stats;
-
--- Check balance targets
-SELECT * FROM qppe_class_targets;
-
--- Check recent samples
-SELECT query_template, performance_class, actual_time 
-FROM qppe_training_data 
-ORDER BY execution_timestamp DESC 
-LIMIT 10;
-```
-
----
-
-## Performance Tuning
-
-### Adjusting Classification Thresholds
-
-If your system has different performance characteristics:
-
-```sql
--- For faster systems
-UPDATE qppe_config SET value = '50' WHERE parameter = 'fast_threshold_ms';
-UPDATE qppe_config SET value = '500' WHERE parameter = 'slow_threshold_ms';
-
--- For slower systems
-UPDATE qppe_config SET value = '200' WHERE parameter = 'fast_threshold_ms';
-UPDATE qppe_config SET value = '2000' WHERE parameter = 'slow_threshold_ms';
-```
-
-### Model Hyperparameters
-
-In `3_qppe_service.py`, adjust the GradientBoostingClassifier parameters:
-
-```python
-self.model = GradientBoostingClassifier(
-    n_estimators=150,      # More trees = better but slower
-    max_depth=7,           # Deeper = more complex patterns
-    learning_rate=0.05,    # Lower = more robust
-    subsample=0.8,         # Prevent overfitting
-    min_samples_split=20,  # Minimum samples to split
-    min_samples_leaf=10,   # Minimum samples in leaf
-    random_state=42
-)
-```
-
----
-
-## API Reference
-
-### Python Classes
-
-#### `EnhancedQPPEService`
-Main ML service class.
-
-```python
-service = EnhancedQPPEService(
-    host='127.0.0.1',
-    port=5555,
-    db_config={'dbname': 'tpch', ...},
-    model_path='qppe_model.pkl'
-)
-service.train_model(use_smote=True, use_cost_sensitive=True)
-prediction = service.predict(features)  # Returns 0, 1, or 2
-```
-
-#### `BalancedDataGenerator`
-Training data generator.
-
-```python
-generator = BalancedDataGenerator(db_config, target_per_class=400)
-generator.generate_balanced_data()
-```
-
-#### `QPPEVisualizer`
-Visualization generator.
-
-```python
-viz = QPPEVisualizer(db_config, output_dir='./figures')
-viz.generate_all()
-```
-
-#### `QPPEValidator`
-Implementation validator.
-
-```python
-validator = QPPEValidator(db_config, model_path='qppe_model.pkl')
-validator.run_full_validation()
-```
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
+- **`qppe_duckdb_corpus.pkl`**, **`qppe_mysql_corpus.pkl`** — the
+  collected plan/timing corpora for the two portability engines, included
+  so that Section 7 of the paper is reproducible without re-running the
+  (multi-hour) collection phase from scratch.
+- **`figures/`** — all 8 paper figures, as both `.pdf` (used in the
+  manuscript) and `.png`.
+- **`job_queries/`** — the 113 JOB query text files.
+- **`appendix.md`** — a worked example of `step10_appendix.py`'s output.
 
 ## Citation
 
-If you use this implementation in your research, please cite:
-
-```bibtex
-@software{qppe2025,
-  title={QPPE: Query Performance Prediction Engine for PostgreSQL},
-  author={Tahar Dilekh},
-  year={2025},
-  url={https://github.com/dilekht/QPPE-Query-Performance-Prediction}
-}
 ```
-
----
+Dilekh, T. Certified Query Steering: Finite-Sample Risk Control for
+Learned Plan Selection. Submitted to The VLDB Journal, 2026.
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## Acknowledgments
-
-- TPC-H Benchmark Council for the benchmark specification
-- scikit-learn team for machine learning tools
-- PostgreSQL community for the database system
-"# Certified-Query-Steering" 
+MIT License (see `LICENSE`).
